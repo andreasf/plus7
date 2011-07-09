@@ -15,6 +15,7 @@ USER_AGENT = 'ARTE 1.1.0 (iPad; iPhone OS 5.0; de_DE)'
 LISTING_FILE = '.plus7.json'
 UPDATE_FREQUENCY = 30 # minutes
 CHUNK = 16384
+LANG = "de"           # try one of fr, en, de. content might change.
 
 
 class Download:
@@ -108,7 +109,7 @@ class Listing:
     def _download_listing(self):
         """Downloads and returns the whole program listing."""
         print "Downloading listing..."
-        lang = "de"
+        lang = LANG
         ts = time.strftime('%Y%m%d')
         page = 1
         programs = list()
@@ -349,8 +350,7 @@ Long Description:
 
 
 def main():
-#    d = Download(REMOTE, "/tmp/iApp/A7_SGT_ENC_10_044206-000-A_PG_HQ_DE_16by9_1240ipad_0.ts", "outf")
-#   d.start()
+    """Main method, parses arguments."""
     if len(sys.argv) > 1:
         try:
             commands = {
