@@ -1,0 +1,443 @@
+#!/usr/bin/python -u
+
+import httplib
+import time
+import glob
+import sys
+import json
+import os.path
+import textwrap
+import urlparse
+from threading import Thread
+
+
+USER_AGENT = 'ARTE 1.1.0 (iPad; iPhone OS 5.0; de_DE)'
+LISTING_FILE = '.plus7.json'
+UPDATE_FREQUENCY = 30 # minutes
+CHUNK = 16384
+
+
+class Download:
+    """Download: includes functionality to download file parts."""
+    def __init__(self, host, path, outfile, start_ts=time.time(), part=1, parts=1, rcvd=0):
+        self.start_ts = start_ts
+        self.received = rcvd
+        self.host = host
+        self.path = path
+        self.length = 0
+        self.outfile = outfile
+        self.done = False
+        self.part = part
+        self.parts = parts
+    
+    def start(self):
+        conn = httplib.HTTPConnection(self.host)
+        headers = {'User-Agent': USER_AGENT, 
+            'Accept-Encoding': 'gzip'}
+        conn.request("GET", self.path, headers=headers)
+        response = conn.getresponse()
+        self.length = float(response.getheader('content-length'))
+        f = open(self.outfile, "w")
+        rate_thread = Thread(target=self.update_rate)
+        rate_thread.daemon = True
+        rate_thread.start()
+        while True:
+            data = response.read(CHUNK)
+            if not data:
+                break
+            f.write(data)
+            self.received = self.received + CHUNK
+        self.done = True
+    
+    def update_rate(self):
+        while True:
+            time.sleep(1)
+            if self.done:
+                break
+            rate = float(self.received) / (time.time() - self.start_ts)
+            seconds = (self.length * (self.parts-(self.part-1))) / rate
+            sys.stdout.write("\r%s/%s\t%s\t eta %s        " % (self.part, 
+                self.parts, human_rate(rate), human_time(seconds)))
+            sys.stdout.flush()
+
+
+class Listing:
+    """Listing: includes methods to download, print and store the program listing, and to show details and download content from this listing."""
+    def __init__(self):
+        self.shows = self._load_listing()
+        if self.shows is None:
+            self.shows = self._download_listing()
+            self._store_listing()
+        
+        #print json.dumps(self.shows, sort_keys=True, indent=4)
+        # - nach id in map packen
+        # - info-funktion
+        # - download
+
+    def _load_listing(self):
+        """Loads the listing from the file, or downloads a new one, if the stored version is too old."""
+        path = self._get_listing_filename()
+        if not os.path.exists(path):
+            return None
+        if time.time() - os.path.getmtime(path) > UPDATE_FREQUENCY * 60:
+            return None
+        f = open(path)
+        data = f.read()
+        f.close()
+        try:
+            j = json.loads(data)
+            return j
+        except:
+            return None
+
+    def _get_listing_filename(self):
+        """Returns the full path of the listing file."""
+        upath = '~/' + LISTING_FILE
+        epath = os.path.expanduser(upath)
+        if upath == epath:
+            epath = LISTING_FILE
+        return epath
+
+    def _store_listing(self):
+        """Stores the program listing in a JSON file."""
+        f = open(self._get_listing_filename(), 'w')
+        f.write(json.dumps(self.shows, indent=4))
+        f.flush()
+        f.close()
+        
+    def _download_listing(self):
+        """Downloads and returns the whole program listing."""
+        lang = "de"
+        ts = time.strftime('%Y%m%d')
+        page = 1
+        programs = list()
+        while True:
+            content = self._download_listing_page(lang, ts, page)
+            if len(content['prs']) == 0:
+                break
+            programs = programs + content['prs']
+            page = page + 1
+        return programs
+
+    def _download_listing_page(self, lang, ts, page):
+        """Downloads one page of the program listing."""
+        conn = httplib.HTTPConnection("programs.arte.tv")
+        headers = {'User-Agent': USER_AGENT, 
+            'Accept-Encoding': 'gzip'}
+        path = "/rest/programs/search?criteria=&language=%s&currentDate=%s&sort=1&pageNumber=%s&programCountByPage=14&deviceType=iPad" % (lang, ts, page)
+        conn.request("GET", path, headers=headers)
+        response = conn.getresponse()
+        data = response.read()
+        return json.loads(data)
+
+    def _item_short(self, item):
+        """Prints a short description of a content item."""
+        title = self._decode_entities(item['tl'])
+        cat = item['ct']
+        id = item['id']
+        dstruct = time.strptime(item['dt'], "%Y%m%d%H%M")
+        date = time.strftime("%a %d-%m-%y %H:%M", dstruct)
+        return "%s\t%s\n\t%s\t%s" % (id, title, date, cat)
+
+    def print_short(self):
+        """Prints a list of available content."""
+        print "id\ttitle"
+        for item in self.shows:
+            print self._item_short(item).encode('UTF-8')
+
+    def _get_content_with_id(self, content_id):
+        """Returns the json data for the given content id, or None, if not available."""
+        item = None
+        for it in self.shows:
+            if str(it['id']) == content_id:
+                item = it
+                break
+        return item
+
+    def download(self, content_id):
+        """Downloads the content with the given id."""
+        item = self._get_content_with_id(content_id)
+        if item is None:
+            print "Unknown id: %s" % (content_id)
+            return
+        uri = item['vid']
+        filename = (self._decode_entities(item['tl']).replace(' ', '_') 
+            + '_' + str(item['id']) + '.mp4')
+        (finished, max_part, precommit) = self._download_status(filename)
+        if finished:
+            print "Download of %s was already finished." % (filename)
+            sys.exit(1)
+        if precommit:
+            self._rollback(filename)
+            self._commit(filename, filename+".part"+str(max_part))
+            max_part = max_part + 1
+        (host, path, bandwidth_list) = self._split_uri(uri)
+        playlist = self._get_playlist_filename(host, path, bandwidth_list)
+        self._download_files(host, path, playlist, filename, max_part)
+
+    def _download_status(self, filename):
+        """Returns a tuple of (is_finished, max_part, pre_commit), which represents the download status. This method is used to find out where to resume the download. If is_finished is True, no part files were found and the download is considered as finished. max_part indicates the number of the download part from which to resume. If pre_commit is True, the download part given in max_part has finished downloading, and was about to be appended to the content file. The size of the content file before the "commit" can be found inside the precommit file."""
+        if os.path.exists(filename):
+            partfiles = glob.glob(filename+".part*")
+            if len(partfiles) == 0:
+                return (True, 1, False)
+            max_part = 1
+            for f in partfiles:
+                this_part = int(f[len(filename+".part"):])
+                if this_part > max_part:
+                    max_part = this_part
+            if os.path.exists(filename+".precommit"):
+                precommit = True
+            else:
+                precommit = False
+            return (False, max_part, precommit)
+        else:
+            return (False, 1, False)
+        
+    def _download_files(self, host, path, playlist_file, filename, start_part):
+        files = list()
+        playlist = self._http_get(host, path + playlist_file)
+        for line in playlist.split('\n'):
+            if line[0] != '#':
+                files.append(line)
+
+        start_ts = time.time()
+        i = start_part 
+        if i > 1:
+            resuming = ", resuming from part %s" % (i)
+        else:
+            resuming = ""
+        print "Downloading %s%s" % (filename, resuming)
+        rcvd = 0
+        if not os.path.exists(filename):
+            self._touch(filename)
+        while i-1 < len(files):
+            f = files[i-1]
+            partfile = "%s.part%s" % (filename, i)
+            d = Download(host, path+f, partfile, start_ts, i, len(files), rcvd)
+            d.start()
+            self._commit(filename, partfile)
+            rcvd = os.path.getsize(filename)
+            i = i + 1
+        print ""
+
+    def _rollback(self, filename):
+        # get size from precommit file
+        pcfile = filename+".precommit"
+        pc = open(pcfile, 'r')
+        size = pc.read()
+        pc.close()
+        try:
+            isize = int(size)
+        except:
+            print "Erroneous precommit file. Delete download files and try again."
+            sys.exit(1)
+        f = open(filename, 'ab')
+        f.truncate(isize)
+        f.close()
+        os.unlink(pcfile)
+            
+    def _commit(self, filename, partfile):
+        # read part
+        pf = open(partfile, 'rb')
+        part = pf.read()
+        pf.close()
+        # store current file size in precommit file
+        pcfile = filename+".precommit"
+        try:
+            size = os.path.getsize(filename)
+        except:
+            size = 0
+        precommit = open(pcfile, 'w')
+        precommit.write(str(size))
+        precommit.flush()
+        precommit.close()
+        # write part to file
+        f = open(filename, 'ab')
+        f.write(part)
+        f.flush()
+        f.close()
+        # remove part and precommit file
+        os.unlink(partfile)
+        os.unlink(pcfile)
+
+    def _touch(self, filename):
+        """Sets atime and mtime of filename, and creates it, if necessary. Taken from http://stackoverflow.com/questions/1158076/implement-touch-using-python.""" 
+        with file(filename, 'a'):
+            os.utime(filename, None)
+
+    def _get_playlist_filename(self, host, path, bandwidth_list):
+        """Downloads the multi-bandwidth playlist, returns the last line, which contains the filename of the playlist with the highest bandwidth."""
+        data = self._http_get(host, path + bandwidth_list)
+        last_line = ''
+        for line in data.split('\n'):
+            if line != "":
+                last_line = line
+        return last_line
+
+    def _http_get(self, host, path):
+        """Returns the response body of a HTTP GET request to http://host/path."""
+        conn = httplib.HTTPConnection(host)
+        headers = {'User-Agent': USER_AGENT, 
+            'Accept-Encoding': 'gzip'}
+        conn.request("GET", path, headers=headers)
+        response = conn.getresponse()
+        data = response.read()
+        conn.close()
+        return data
+
+    def _split_uri(self, uri):
+        """Splits a uri, returns a tuple of (host, path_prefix, file_suffix), where file_suffix is the "file name" of the uri (what's after the last '/'), and path_prefix is the "directory" of the uri (up to the last '/')."""
+        usplit = urlparse.urlsplit(uri)
+        psplit = usplit.path.split('/')
+        uri_file = psplit[-1:][0]
+        path_prefix = "/".join(psplit[:-1]) + "/"
+        return (usplit.netloc, path_prefix, uri_file)
+
+    def print_details(self, content_id):
+        item = self._get_content_with_id(content_id)
+        if item is None:
+            print "Unknown id: %s" % (content_id)
+        else:
+            tl = self._wrap(item['tl'], 2)
+            st = self._wrap(item['tea'], 2)
+            cat = item['ct']
+            dstruct = time.strptime(item['dt'], "%Y%m%d%H%M")
+            date = time.strftime("%a %d-%m-%y %H:%M", dstruct)
+            url = item['lin']
+            sdes = self._wrap(item['hea'])
+            ldes = self._wrap(item['des'])
+            details = """Title:\t\t%s
+Subtitle:\t%s
+Category:\t%s
+Air date:\t%s
+
+%s
+
+%s
+
+Long Description:
+%s""" % (tl, st, cat, date, url, sdes, ldes)
+        print details
+
+    def _wrap(self, text, tabs=0):
+        (w, h) = getTerminalSize()
+        width = w - tabs * 8
+        unitext = self._decode_entities(text)
+        lines = textwrap.wrap(unitext, width)
+        prefix = "\n"
+        for i in range(0, tabs):
+            prefix = prefix + "\t"
+        return prefix.join(lines)
+        
+    def _decode_entities(self, text):
+        entity = False
+        i = 0
+        buf = ''
+        ret = ''
+        while i < len(text):
+            if i < len(text) - 3 and text[i:i+2] == '&#':
+                entity = True
+                i = i + 2
+            if entity:
+                if text[i] != ';':
+                    buf = buf + text[i]
+                else:
+                    ret = ret + unichr(int(buf))
+                    buf = ''
+                    entity = False
+            else:
+                ret = ret + text[i]
+            i = i + 1
+        return ret
+
+
+def main():
+#    d = Download(REMOTE, "/tmp/iApp/A7_SGT_ENC_10_044206-000-A_PG_HQ_DE_16by9_1240ipad_0.ts", "outf")
+#   d.start()
+    if len(sys.argv) > 1:
+        try:
+            commands = {
+                'download': lambda x: download(x),
+                'info': lambda x: info(x),
+            }[sys.argv[1]](sys.argv[2])
+        except (IndexError, KeyError):
+            print_usage()
+    else:
+        l = Listing()
+        l.print_short()
+
+def info(content_id):
+    """Prints information about content item with id content_id."""
+    l = Listing()
+    l.print_details(content_id)
+
+def download(content_id):
+    """Downloads content with given id."""
+    l = Listing()
+    l.download(content_id)
+
+def print_usage():
+    """Prints usage information."""
+    print """Usage: plus7 [options...]
+Options: 
+  download <id>: download content
+  info <id>:     show detailed information for content
+
+If no option is specified, plus7 displays a list of available content."""
+
+def human_rate(rate):
+    """Converts a data transfer rate of rate from Bytes/sec to a human readable string."""
+    exp = 0
+    rate = float(rate)
+    while rate > 1024:
+        exp = exp + 1
+        rate = rate / 1024
+    unit = ['B', 'kB', 'MB', 'GB', 'TB']
+    try:
+        ret = "%.2f %s/s" % (rate, unit[exp])
+    except:
+        ret = "%.2f 1e%s B/s" % (rate, exp)
+    return ret
+
+def human_time(seconds):
+    """Converts a duration from seconds to a human readable string."""
+    sec = int(seconds)
+    h = sec / 3600
+    m = (sec / 60) % 60
+    s = sec % 60
+    if h > 0:
+        return "%sh%sm%ss" % (h, m, s)
+    if m > 0:
+        return "%sm%ss" % (m, s)
+    return "%ss" % (s)
+
+def getTerminalSize():
+    """Returns console size as (width, height). Taken from
+    http://stackoverflow.com/questions/566746/how-to-get-console-window-width-in-python"""
+    def ioctl_GWINSZ(fd):
+        try:
+            import fcntl, termios, struct, os
+            cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,
+        '1234'))
+        except:
+            return None
+        return cr
+    cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+    if not cr:
+        try:
+            fd = os.open(os.ctermid(), os.O_RDONLY)
+            cr = ioctl_GWINSZ(fd)
+            os.close(fd)
+        except:
+            pass
+    if not cr:
+        try:
+            cr = (env['LINES'], env['COLUMNS'])
+        except:
+            cr = (25, 80)
+    return int(cr[1]), int(cr[0])
+
+
+if __name__ == '__main__':
+    main()
