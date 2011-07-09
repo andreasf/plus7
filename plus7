@@ -324,7 +324,7 @@ Air date:\t%s
 
 Long Description:
 %s""" % (tl, st, cat, date, url, sdes, ldes)
-        print details
+        print details.encode('UTF-8')
 
     def _wrap(self, text, tabs=0):
         (w, h) = getTerminalSize()
