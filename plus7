@@ -1,4 +1,13 @@
 #!/usr/bin/python -u
+"""
+plus7: arte+7 command line interface
+
+usage:
+plus7                   for the program listing
+plus7 info <id>         for information on content
+plus7 download <id>     to download content
+
+"""
 
 import httplib
 import time
