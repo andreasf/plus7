@@ -107,6 +107,7 @@ class Listing:
         
     def _download_listing(self):
         """Downloads and returns the whole program listing."""
+        print "Downloading listing..."
         lang = "de"
         ts = time.strftime('%Y%m%d')
         page = 1
@@ -121,13 +122,8 @@ class Listing:
 
     def _download_listing_page(self, lang, ts, page):
         """Downloads one page of the program listing."""
-        conn = httplib.HTTPConnection("programs.arte.tv")
-        headers = {'User-Agent': USER_AGENT, 
-            'Accept-Encoding': 'gzip'}
         path = "/rest/programs/search?criteria=&language=%s&currentDate=%s&sort=1&pageNumber=%s&programCountByPage=14&deviceType=iPad" % (lang, ts, page)
-        conn.request("GET", path, headers=headers)
-        response = conn.getresponse()
-        data = response.read()
+        data = self._http_get("programs.arte.tv", path)
         return json.loads(data)
 
     def _item_short(self, item):
