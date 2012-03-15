@@ -1,4 +1,4 @@
-#!/usr/bin/python -u
+#!/usr/bin/python 
 """
 plus7: arte+7 command line interface
 
@@ -167,7 +167,8 @@ class Listing:
             print "Unknown id: %s" % (content_id)
             return
         uri = item['vid']
-        filename = (self._decode_entities(item['tl']).replace(' ', '_') 
+        filename = (self._decode_entities(item['tl']).replace(' ',
+            '_').replace('/', '_')
             + '_' + str(item['id']) + '.mp4')
         (finished, max_part, precommit) = self._download_status(filename)
         if finished:
@@ -204,7 +205,7 @@ class Listing:
         files = list()
         playlist = self._http_get(host, path + playlist_file)
         for line in playlist.split('\n'):
-            if line[0] != '#':
+            if line != '#':
                 files.append(line)
 
         start_ts = time.time()
@@ -324,7 +325,7 @@ Air date:\t%s
 
 Long Description:
 %s""" % (tl, st, cat, date, url, sdes, ldes)
-        print details.encode('UTF-8')
+            print details.encode('UTF-8')
 
     def _wrap(self, text, tabs=0):
         (w, h) = getTerminalSize()
