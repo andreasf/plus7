@@ -1,4 +1,4 @@
-#!/usr/bin/python 
+#!/usr/bin/python -u
 """
 plus7: arte+7 command line interface
 
